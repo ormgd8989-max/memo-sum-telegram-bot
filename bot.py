@@ -1,88 +1,138 @@
+# bot.py
 import os
 import re
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import json
+import requests
+from flask import Flask, request, jsonify
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Render 환경변수로 주입
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # Render에서 설정할 환경변수
+if not TOKEN:
+    print("Warning: TELEGRAM_BOT_TOKEN not set (use Render env var).")
 
+app = Flask(__name__)
+
+# 간단 메모 저장 (서버 메모리). 채팅별로 마지막 보낸 텍스트 저장.
+last_messages = {}  # chat_id -> text
+
+########### 유틸: 숫자 파싱 ###########
 def parse_amount_kor(num_str: str) -> int:
-    """
-    '25만', '150000원', '3000000', '3,000,000원' 등 대응.
-    '만'이 붙으면 10,000 곱함. 콤마/원 제거.
-    """
-    num_str = num_str.strip()
-    # '만' 표기 처리
-    m = re.match(r"^([\d,]+)\s*만(?:원)?$", num_str)
+    s = num_str.strip().replace(",", "")
+    # '만' 단위 처리 (예: 25만, 25만원)
+    m = re.match(r"^(\d+)\s*만(?:원)?$", s)
     if m:
-        val = int(m.group(1).replace(",", "")) * 10000
-        return val
-    # 일반 숫자 + 선택적 '원'
-    m = re.match(r"^([\d,]+)\s*(?:원)?$", num_str)
+        return int(m.group(1)) * 10000
+    # 일반 숫자 (예: 150000원, 3000000)
+    m = re.match(r"^(\d+)\s*(?:원)?$", s)
     if m:
-        val = int(m.group(1).replace(",", ""))
-        return val
-    # 기타: 못 읽으면 0
+        return int(m.group(1))
     return 0
 
-def extract_and_sum(text: str) -> tuple[int, list[tuple[str,int]]]:
+def extract_and_sum(text: str):
     """
-    - 원문에서 '메모'가 등장하는 줄을 기준으로,
-      그 다음 줄(= 이름 + 금액)에서 금액만 추출해 합산.
-    - 사람별 금액도 같이 반환.
+    - '메모' 라인 다음 줄에서 '이름 ... 숫자' 패턴을 찾아 합계와 사람별 총합 반환
+    - 전체 문서에 있는 모든 '메모' 섹션을 순회해 합산함
     """
     lines = text.splitlines()
     total = 0
-    per_person: dict[str, int] = {}
+    per_person = {}
 
     for i, line in enumerate(lines):
         if line.strip() == "메모" and i + 1 < len(lines):
-            next_line = lines[i + 1].strip()
-            # 예: '유득경 40000', '이승한 150000원', '조현우 60000원'
-            # 이름(한글/영문) + 공백 + 금액표현(숫자[,]+, 선택적 '만', 선택적 '원')
-            m = re.match(r"^([가-힣A-Za-z]+)\s+([0-9][\d,]*\s*(?:만)?(?:원)?)$", next_line)
+            nxt = lines[i + 1].strip()
+            # 이름(한글/영문) + (그 뒤에 숫자 포함 토큰) 을 찾는다
+            m = re.search(r"([가-힣A-Za-z]+)[^\d\n]*?([\d,]+(?:만)?(?:원)?)", nxt)
             if m:
                 name = m.group(1)
-                amount_str = m.group(2)
-                val = parse_amount_kor(amount_str)
+                amt_str = m.group(2)
+                val = parse_amount_kor(amt_str)
                 total += val
                 per_person[name] = per_person.get(name, 0) + val
 
-    # 정렬: 금액 큰 순
-    per_person_sorted = sorted(per_person.items(), key=lambda x: x[1], reverse=True)
-    return total, per_person_sorted
+    # 정렬해서 리스트로 반환 (내림차순)
+    per_sorted = sorted(per_person.items(), key=lambda x: x[1], reverse=True)
+    return total, per_sorted
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "붙여넣기만 하면 ‘메모’ 바로 밑 줄의 금액을 전부 더해드려요.\n"
-        "예시 입력:\n\n"
-        "메모\n이승한 150000원\n+106.68\n≈ 0\n\n"
-        "메모\n유득경 40000\n..."
-    )
-    await update.message.reply_text(msg)
+########### Telegram API 헬퍼 ###########
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    total, per_person = extract_and_sum(text)
-    if total == 0:
-        await update.message.replyText("합산할 금액이 없어요. ‘메모’ 바로 아래 줄에 ‘이름 숫자’ 형태인지 확인해주세요.")
-        return
+def send_message(chat_id, text, reply_markup=None):
+    url = f"{BASE_URL}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    r = requests.post(url, data=payload, timeout=10)
+    return r.ok, r.text
 
-    # 사람별 요약(상위 5명까지만)
-    top = "\n".join([f"- {name}: {amt:,}원" for name, amt in per_person)
-    resp = f"📊 합계: {total:,}원"
-    if top:
-        resp += f"\n\n👤 상위 5명:\n{top}"
-    await update.message.reply_text(resp)
+def answer_callback(callback_query_id, text=None):
+    url = f"{BASE_URL}/answerCallbackQuery"
+    data = {"callback_query_id": callback_query_id}
+    if text:
+        data["text"] = text
+    requests.post(url, data=data, timeout=10)
 
-def main():
-    token = TOKEN or ""
-    if not token:
-        raise RuntimeError("환경변수 TELEGRAM_BOT_TOKEN 이 설정되지 않았습니다.")
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Render에서 폴링 방식으로 실행
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+########### Routes ###########
+@app.route("/", methods=["GET"])
+def index():
+    return "OK - MemoSum Bot is running"
+
+@app.route("/setwebhook", methods=["GET"])
+def set_webhook():
+    # 호출하면 현재 앱의 주소 기반으로 webhook을 등록 (Render URL로 접속해서 호출)
+    # request.url_root 는 https://your-service.onrender.com/ 로 나옴
+    webhook_url = request.url_root.rstrip("/") + "/webhook"
+    url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
+    resp = requests.post(url, data={"url": webhook_url})
+    return jsonify({"setWebhook_resp": resp.json(), "webhook_url": webhook_url})
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True)
+    # Telegram Update 에서 message 또는 callback_query 처리
+    if "message" in data:
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        text = msg.get("text", "")
+        # 저장: 가장 최근에 보낸 텍스트로 덮어쓰기
+        last_messages[chat_id] = text
+
+        # 버튼(InlineKeyboard) 보내기
+        keyboard = {"inline_keyboard": [[{"text": "계산 시작", "callback_data": "calc_start"}]]}
+        send_message(chat_id, "메시지 저장 완료 ✅\n계산하려면 아래 '계산 시작' 버튼을 눌러주세요.", reply_markup=keyboard)
+        return "", 200
+
+    if "callback_query" in data:
+        cq = data["callback_query"]
+        data_cb = cq.get("data")
+        chat_id = cq["message"]["chat"]["id"]
+        cq_id = cq["id"]
+
+        # 답장(버튼 로딩 해제)
+        answer_callback(cq_id)
+
+        if data_cb == "calc_start":
+            # 계산 실행
+            text = last_messages.get(chat_id)
+            if not text:
+                send_message(chat_id, "저장된 메시지가 없습니다. 먼저 텍스트를 붙여넣고 다시 시도하세요.")
+                return "", 200
+
+            total, per_sorted = extract_and_sum(text)
+            if total == 0:
+                send_message(chat_id, "합산할 금액을 찾지 못했습니다. 포맷을 확인해주세요.")
+                return "", 200
+
+            # 메시지 구성 (전체 출력)
+            lines = [f"📊 합계: {total:,}원", "", "👥 전체 내역:"]
+            for idx, (name, amt) in enumerate(per_sorted, start=1):
+                lines.append(f"{idx}. {name}: {amt:,}원")
+            result_text = "\n".join(lines)
+            send_message(chat_id, result_text)
+            # (선택) 계산 후 저장된 텍스트 삭제하려면 다음 줄 주석 해제:
+            # last_messages.pop(chat_id, None)
+            return "", 200
+
+    return "", 200
 
 if __name__ == "__main__":
-    main()
+    # 로컬 테스트용 (Render에서는 gunicorn으로 실행)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
