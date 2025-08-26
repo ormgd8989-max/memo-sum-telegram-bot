@@ -68,7 +68,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 사람별 요약(상위 5명까지만)
-    top = "\n".join([f"- {name}: {amt:,}원" for name, amt in per_person[:5]])
+    top = "\n".join([f"- {name}: {amt:,}원" for name, amt in per_person)
     resp = f"📊 합계: {total:,}원"
     if top:
         resp += f"\n\n👤 상위 5명:\n{top}"
